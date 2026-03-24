@@ -8,6 +8,13 @@ winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+winrt::fire_and_forget SetupMediaSession();
+winrt::fire_and_forget UpdateNowPlayingCache();
+
+// Passed via PostMessageW lParam to marshal DeviceInformation to main thread
+struct ReconnectData {
+	DeviceInformation device;
+};
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -66,11 +73,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	g_xamlCanvas = Canvas();
 	desktopSource.Content(g_xamlCanvas);
 
+	// Capture dispatcher queue for marshalling to UI thread from background callbacks
+	g_dispatcherQueue = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
+
 	LoadSettings();
 	SetupFlyout();
 	SetupMenu();
 	SetupDevicePicker();
 	SetupSvgIcon();
+	SetupMediaSession();
 
 	g_nid.hWnd = g_niid.hWnd = g_hWnd;
 	wcscpy_s(g_nid.szTip, _(L"AudioPlaybackConnector"));
@@ -101,6 +112,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message)
 	{
 	case WM_DESTROY:
+		KillTimer(hWnd, IDT_RECONNECT);
+		g_pendingReconnect.clear();
+		g_reconnectAttempts.clear();
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
 			connection.second.second.Close();
@@ -178,6 +192,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	case WM_CONNECTDEVICE:
+		// Startup reconnect to last saved devices
 		if (g_reconnect)
 		{
 			for (const auto& i : g_lastDevices)
@@ -185,6 +200,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				ConnectDevice(g_devicePicker, i);
 			}
 			g_lastDevices.clear();
+		}
+		break;
+	case WM_RECONNECTDEVICE:
+	{
+		// Runtime reconnect: lParam is heap-allocated ReconnectData*, we own it
+		auto pData = std::unique_ptr<ReconnectData>(reinterpret_cast<ReconnectData*>(lParam));
+		auto deviceId = std::wstring(pData->device.Id());
+
+		// Track this device for reconnection
+		g_pendingReconnect.push_back(pData->device);
+		g_reconnectAttempts[deviceId] = 0;
+
+		// Start (or reset) the reconnect timer
+		SetTimer(hWnd, IDT_RECONNECT, RECONNECT_DELAY_MS, nullptr);
+		break;
+	}
+	case WM_TIMER:
+		if (wParam == IDT_RECONNECT)
+		{
+			std::vector<DeviceInformation> stillPending;
+			for (auto& device : g_pendingReconnect)
+			{
+				auto deviceId = std::wstring(device.Id());
+
+				// Already reconnected by some other means
+				if (g_audioPlaybackConnections.count(deviceId))
+				{
+					g_reconnectAttempts.erase(deviceId);
+					continue;
+				}
+
+				auto& attempts = g_reconnectAttempts[deviceId];
+				if (attempts < MAX_RECONNECT_ATTEMPTS)
+				{
+					attempts++;
+					ConnectDevice(g_devicePicker, device);
+					stillPending.push_back(device);
+				}
+				else
+				{
+					// Give up — show retry button so user can manually retry
+					g_devicePicker.SetDisplayStatus(device, _(L"Connection lost"), DevicePickerDisplayStatusOptions::ShowRetryButton);
+					g_reconnectAttempts.erase(deviceId);
+				}
+			}
+			g_pendingReconnect = std::move(stillPending);
+
+			if (g_pendingReconnect.empty())
+				KillTimer(hWnd, IDT_RECONNECT);
 		}
 		break;
 	default:
@@ -229,6 +293,84 @@ void SetupFlyout()
 
 void SetupMenu()
 {
+	// --- Now Playing display ---
+	FontIcon musicIcon;
+	musicIcon.Glyph(L"\xE8D6");
+
+	g_nowPlayingItem = MenuFlyoutItem();
+	g_nowPlayingItem.Icon(musicIcon);
+	g_nowPlayingItem.Visibility(Visibility::Collapsed);
+	g_nowPlayingItem.Click([](const auto&, const auto&) {
+		if (g_smtcSessionManager)
+		{
+			auto session = g_smtcSessionManager.GetCurrentSession();
+			if (session)
+				session.TryActivateAsync();
+		}
+	});
+
+	// --- Media transport controls ---
+	FontIcon prevIcon;
+	prevIcon.Glyph(L"\xE892");
+	g_prevItem = MenuFlyoutItem();
+	g_prevItem.Text(_(L"Previous"));
+	g_prevItem.Icon(prevIcon);
+	g_prevItem.Visibility(Visibility::Collapsed);
+	g_prevItem.Click([](const auto&, const auto&) {
+		if (g_smtcSessionManager)
+		{
+			auto session = g_smtcSessionManager.GetCurrentSession();
+			if (session) session.TrySkipPreviousAsync();
+		}
+	});
+
+	g_playPauseItem = MenuFlyoutItem();
+	g_playPauseItem.Visibility(Visibility::Collapsed);
+	g_playPauseItem.Click([](const auto&, const auto&) {
+		if (g_smtcSessionManager)
+		{
+			auto session = g_smtcSessionManager.GetCurrentSession();
+			if (session) session.TryTogglePlayPauseAsync();
+		}
+	});
+
+	FontIcon nextIcon;
+	nextIcon.Glyph(L"\xE893");
+	g_nextItem = MenuFlyoutItem();
+	g_nextItem.Text(_(L"Next"));
+	g_nextItem.Icon(nextIcon);
+	g_nextItem.Visibility(Visibility::Collapsed);
+	g_nextItem.Click([](const auto&, const auto&) {
+		if (g_smtcSessionManager)
+		{
+			auto session = g_smtcSessionManager.GetCurrentSession();
+			if (session) session.TrySkipNextAsync();
+		}
+	});
+
+	g_mediaSeparator = MenuFlyoutSeparator();
+	g_mediaSeparator.Visibility(Visibility::Collapsed);
+
+	// --- Toggles ---
+	g_showNowPlayingToggle = ToggleMenuFlyoutItem();
+	g_showNowPlayingToggle.Text(_(L"Show Now Playing"));
+	g_showNowPlayingToggle.IsChecked(g_showNowPlaying);
+	g_showNowPlayingToggle.Click([](const auto&, const auto&) {
+		g_showNowPlaying = g_showNowPlayingToggle.IsChecked();
+		SaveSettings();
+	});
+
+	g_autoReconnectToggle = ToggleMenuFlyoutItem();
+	g_autoReconnectToggle.Text(_(L"Auto-Reconnect"));
+	g_autoReconnectToggle.IsChecked(g_autoReconnect);
+	g_autoReconnectToggle.Click([](const auto&, const auto&) {
+		g_autoReconnect = g_autoReconnectToggle.IsChecked();
+		SaveSettings();
+	});
+
+	MenuFlyoutSeparator separator;
+
+	// --- Existing items ---
 	// https://docs.microsoft.com/en-us/windows/uwp/design/style/segoe-ui-symbol-font
 	FontIcon settingsIcon;
 	settingsIcon.Glyph(L"\xE713");
@@ -271,10 +413,52 @@ void SetupMenu()
 	});
 
 	MenuFlyout menu;
+	menu.Items().Append(g_nowPlayingItem);
+	menu.Items().Append(g_prevItem);
+	menu.Items().Append(g_playPauseItem);
+	menu.Items().Append(g_nextItem);
+	menu.Items().Append(g_mediaSeparator);
+	menu.Items().Append(g_showNowPlayingToggle);
+	menu.Items().Append(g_autoReconnectToggle);
+	menu.Items().Append(separator);
 	menu.Items().Append(settingsItem);
 	menu.Items().Append(exitItem);
+
 	menu.Opened([](const auto& sender, const auto&) {
-		auto menuItems = sender.as<MenuFlyout>().Items();
+		GlobalSystemMediaTransportControlsSession session = nullptr;
+		if (g_smtcSessionManager)
+			session = g_smtcSessionManager.GetCurrentSession();
+
+		bool hasSession = session != nullptr;
+		bool showNowPlayingItem = g_showNowPlaying && hasSession && !g_nowPlayingText.empty();
+
+		g_nowPlayingItem.Visibility(showNowPlayingItem ? Visibility::Visible : Visibility::Collapsed);
+		if (showNowPlayingItem)
+			g_nowPlayingItem.Text(g_nowPlayingText);
+
+		Visibility mediaVis = hasSession ? Visibility::Visible : Visibility::Collapsed;
+		g_prevItem.Visibility(mediaVis);
+		g_playPauseItem.Visibility(mediaVis);
+		g_nextItem.Visibility(mediaVis);
+		g_mediaSeparator.Visibility(mediaVis);
+
+		if (hasSession)
+		{
+			// Query playback status live so icon is always accurate
+			auto playbackInfo = session.GetPlaybackInfo();
+			bool isPlaying = playbackInfo.PlaybackStatus() == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+			FontIcon playPauseIcon;
+			playPauseIcon.Glyph(isPlaying ? L"\xE769" : L"\xE768");
+			g_playPauseItem.Icon(playPauseIcon);
+			g_playPauseItem.Text(isPlaying ? _(L"Pause") : _(L"Play"));
+		}
+
+		g_showNowPlayingToggle.IsChecked(g_showNowPlaying);
+		g_autoReconnectToggle.IsChecked(g_autoReconnect);
+
+		// Focus last visible item for keyboard navigation
+		auto menuFlyout = sender.as<MenuFlyout>();
+		auto menuItems = menuFlyout.Items();
 		auto itemsCount = menuItems.Size();
 		if (itemsCount > 0)
 		{
@@ -287,6 +471,71 @@ void SetupMenu()
 	});
 
 	g_xamlMenu = menu;
+}
+
+winrt::fire_and_forget SetupMediaSession()
+{
+	try
+	{
+		g_smtcSessionManager = co_await GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+
+		// Initial cache update
+		UpdateNowPlayingCache();
+
+		// Subscribe to session and playback changes
+		g_smtcSessionManager.CurrentSessionChanged([](const auto&, const auto&) {
+			UpdateNowPlayingCache();
+		});
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
+winrt::fire_and_forget UpdateNowPlayingCache()
+{
+	try
+	{
+		if (!g_smtcSessionManager)
+			co_return;
+
+		auto session = g_smtcSessionManager.GetCurrentSession();
+		if (!session)
+		{
+			if (g_dispatcherQueue)
+			{
+				g_dispatcherQueue.TryEnqueue([]{
+					g_nowPlayingText.clear();
+					g_isPlaying = false;
+				});
+			}
+			co_return;
+		}
+
+		auto props = co_await session.TryGetMediaPropertiesAsync();
+		std::wstring text;
+		if (props)
+		{
+			auto title = std::wstring(props.Title());
+			auto artist = std::wstring(props.Artist());
+			if (artist.empty())
+				text = title;
+			else
+				text = artist + L" \u2013 " + title; // en-dash separator
+		}
+
+		if (g_dispatcherQueue)
+		{
+			g_dispatcherQueue.TryEnqueue([text = std::move(text)]{
+				g_nowPlayingText = text;
+			});
+		}
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
 }
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
@@ -306,10 +555,22 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			connection.StateChanged([](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
-					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
+					auto deviceId = std::wstring(sender.DeviceId());
+					auto it = g_audioPlaybackConnections.find(deviceId);
 					if (it != g_audioPlaybackConnections.end())
 					{
-						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+						if (g_autoReconnect)
+						{
+							// Show reconnecting status and schedule retry on main thread
+							g_devicePicker.SetDisplayStatus(it->second.first, _(L"Reconnecting..."),
+								DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+							auto pData = new ReconnectData{ it->second.first };
+							PostMessageW(g_hWnd, WM_RECONNECTDEVICE, 0, reinterpret_cast<LPARAM>(pData));
+						}
+						else
+						{
+							g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+						}
 						g_audioPlaybackConnections.erase(it);
 					}
 					sender.Close();
@@ -400,13 +661,27 @@ void SetupDevicePicker()
 	});
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+		auto deviceId = std::wstring(device.Id());
+
+		// Cancel any pending reconnect for this device (user-initiated disconnect)
+		g_reconnectAttempts.erase(deviceId);
+		auto it2 = std::find_if(g_pendingReconnect.begin(), g_pendingReconnect.end(),
+			[&deviceId](const DeviceInformation& d) { return std::wstring(d.Id()) == deviceId; });
+		if (it2 != g_pendingReconnect.end())
+			g_pendingReconnect.erase(it2);
+		if (g_pendingReconnect.empty())
+			KillTimer(g_hWnd, IDT_RECONNECT);
+
+		auto it = g_audioPlaybackConnections.find(deviceId);
 		if (it != g_audioPlaybackConnections.end())
 		{
 			it->second.second.Close();
 			g_audioPlaybackConnections.erase(it);
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
+	});
+	g_devicePicker.RetryButtonClicked([](const auto& sender, const auto& args) {
+		ConnectDevice(sender, args.Device());
 	});
 }
 
