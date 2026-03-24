@@ -54,6 +54,9 @@ bool g_autoReconnect = true;
 std::vector<DeviceInformation> g_pendingReconnect;
 std::unordered_map<std::wstring, int> g_reconnectAttempts;
 
+// Best-matched SMTC session (Bluetooth device preferred over PC apps), updated on UI thread
+GlobalSystemMediaTransportControlsSession g_bluetoothSession = nullptr;
+
 // Media control menu items (need global refs for dynamic updates)
 MenuFlyoutItem g_nowPlayingItem = nullptr;
 ToggleMenuFlyoutItem g_showNowPlayingToggle = nullptr;
