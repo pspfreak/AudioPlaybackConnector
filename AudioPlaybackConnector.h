@@ -13,6 +13,10 @@ namespace fs = std::filesystem;
 
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
+constexpr UINT WM_RECONNECTDEVICE = WM_APP + 3;
+constexpr UINT_PTR IDT_RECONNECT = 1;
+constexpr UINT RECONNECT_DELAY_MS = 5000;
+constexpr int MAX_RECONNECT_ATTEMPTS = 3;
 
 HINSTANCE g_hInst;
 HWND g_hWnd;
@@ -37,6 +41,14 @@ NOTIFYICONIDENTIFIER g_niid = {
 UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
 std::vector<std::wstring> g_lastDevices;
+
+// Auto-reconnect on unexpected disconnect
+bool g_autoReconnect = true;
+std::vector<DeviceInformation> g_pendingReconnect;
+std::unordered_map<std::wstring, int> g_reconnectAttempts;
+
+// Menu item for auto-reconnect toggle
+ToggleMenuFlyoutItem g_autoReconnectToggle = nullptr;
 
 #include "Util.hpp"
 #include "I18n.hpp"

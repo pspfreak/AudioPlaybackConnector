@@ -4,10 +4,16 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
+winrt::fire_and_forget ConnectDevice(DevicePicker, DeviceInformation);
 winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+
+// Passed via PostMessageW lParam to marshal DeviceInformation to main thread
+struct ReconnectData {
+	DeviceInformation device;
+};
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -101,6 +107,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message)
 	{
 	case WM_DESTROY:
+		KillTimer(hWnd, IDT_RECONNECT);
+		g_pendingReconnect.clear();
+		g_reconnectAttempts.clear();
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
 			connection.second.second.Close();
@@ -178,6 +187,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	case WM_CONNECTDEVICE:
+		// Startup reconnect to last saved devices
 		if (g_reconnect)
 		{
 			for (const auto& i : g_lastDevices)
@@ -185,6 +195,53 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				ConnectDevice(g_devicePicker, i);
 			}
 			g_lastDevices.clear();
+		}
+		break;
+	case WM_RECONNECTDEVICE:
+	{
+		// Runtime reconnect: lParam is heap-allocated ReconnectData*, we own it
+		auto pData = std::unique_ptr<ReconnectData>(reinterpret_cast<ReconnectData*>(lParam));
+		auto deviceId = std::wstring(pData->device.Id());
+
+		g_pendingReconnect.push_back(pData->device);
+		g_reconnectAttempts[deviceId] = 0;
+
+		// Start (or reset) the reconnect timer
+		SetTimer(hWnd, IDT_RECONNECT, RECONNECT_DELAY_MS, nullptr);
+		break;
+	}
+	case WM_TIMER:
+		if (wParam == IDT_RECONNECT)
+		{
+			std::vector<DeviceInformation> stillPending;
+			for (auto& device : g_pendingReconnect)
+			{
+				auto deviceId = std::wstring(device.Id());
+
+				// Already reconnected
+				if (g_audioPlaybackConnections.count(deviceId))
+				{
+					g_reconnectAttempts.erase(deviceId);
+					continue;
+				}
+
+				auto& attempts = g_reconnectAttempts[deviceId];
+				if (attempts < MAX_RECONNECT_ATTEMPTS)
+				{
+					attempts++;
+					ConnectDevice(g_devicePicker, device);
+					stillPending.push_back(device);
+				}
+				else
+				{
+					g_devicePicker.SetDisplayStatus(device, _(L"Connection lost"), DevicePickerDisplayStatusOptions::ShowRetryButton);
+					g_reconnectAttempts.erase(deviceId);
+				}
+			}
+			g_pendingReconnect = std::move(stillPending);
+
+			if (g_pendingReconnect.empty())
+				KillTimer(hWnd, IDT_RECONNECT);
 		}
 		break;
 	default:
@@ -229,6 +286,16 @@ void SetupFlyout()
 
 void SetupMenu()
 {
+	g_autoReconnectToggle = ToggleMenuFlyoutItem();
+	g_autoReconnectToggle.Text(_(L"Auto-Reconnect"));
+	g_autoReconnectToggle.IsChecked(g_autoReconnect);
+	g_autoReconnectToggle.Click([](const auto&, const auto&) {
+		g_autoReconnect = g_autoReconnectToggle.IsChecked();
+		SaveSettings();
+	});
+
+	MenuFlyoutSeparator separator;
+
 	// https://docs.microsoft.com/en-us/windows/uwp/design/style/segoe-ui-symbol-font
 	FontIcon settingsIcon;
 	settingsIcon.Glyph(L"\xE713");
@@ -271,9 +338,14 @@ void SetupMenu()
 	});
 
 	MenuFlyout menu;
+	menu.Items().Append(g_autoReconnectToggle);
+	menu.Items().Append(separator);
 	menu.Items().Append(settingsItem);
 	menu.Items().Append(exitItem);
+
 	menu.Opened([](const auto& sender, const auto&) {
+		g_autoReconnectToggle.IsChecked(g_autoReconnect);
+
 		auto menuItems = sender.as<MenuFlyout>().Items();
 		auto itemsCount = menuItems.Size();
 		if (itemsCount > 0)
@@ -306,10 +378,21 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			connection.StateChanged([](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
-					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
+					auto deviceId = std::wstring(sender.DeviceId());
+					auto it = g_audioPlaybackConnections.find(deviceId);
 					if (it != g_audioPlaybackConnections.end())
 					{
-						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+						if (g_autoReconnect)
+						{
+							g_devicePicker.SetDisplayStatus(it->second.first, _(L"Reconnecting..."),
+								DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+							auto pData = new ReconnectData{ it->second.first };
+							PostMessageW(g_hWnd, WM_RECONNECTDEVICE, 0, reinterpret_cast<LPARAM>(pData));
+						}
+						else
+						{
+							g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+						}
 						g_audioPlaybackConnections.erase(it);
 					}
 					sender.Close();
@@ -400,7 +483,18 @@ void SetupDevicePicker()
 	});
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+		auto deviceId = std::wstring(device.Id());
+
+		// Cancel any pending reconnect for this device (user-initiated disconnect)
+		g_reconnectAttempts.erase(deviceId);
+		auto it2 = std::find_if(g_pendingReconnect.begin(), g_pendingReconnect.end(),
+			[&deviceId](const DeviceInformation& d) { return std::wstring(d.Id()) == deviceId; });
+		if (it2 != g_pendingReconnect.end())
+			g_pendingReconnect.erase(it2);
+		if (g_pendingReconnect.empty())
+			KillTimer(g_hWnd, IDT_RECONNECT);
+
+		auto it = g_audioPlaybackConnections.find(deviceId);
 		if (it != g_audioPlaybackConnections.end())
 		{
 			it->second.second.Close();
