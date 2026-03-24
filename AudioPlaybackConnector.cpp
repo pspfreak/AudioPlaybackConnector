@@ -486,9 +486,13 @@ winrt::fire_and_forget SetupMediaSession()
 	}
 }
 
-// Must be called on the UI thread. Picks the best SMTC session:
-// prefers a session whose SourceAppUserModelId contains a connected device's
-// name (AVRCP metadata from the phone), falls back to the current session.
+// Must be called on the UI thread. Picks the best SMTC session when a
+// Bluetooth device is connected, using a tiered strategy:
+//   1. Session whose SourceAppUserModelId contains the device name (ideal AVRCP match)
+//   2. First session that looks like a system/BT session (no '.' in the ID —
+//      standard app IDs always have at least one: "Spotify.exe", "Microsoft.ZuneMusic_...")
+//   3. Any available session (best-effort)
+//   4. If no BT device connected, fall back to the current focused session
 void UpdateBluetoothSession()
 {
 	if (!g_smtcSessionManager)
@@ -499,30 +503,49 @@ void UpdateBluetoothSession()
 
 	auto sessions = g_smtcSessionManager.GetSessions();
 
-	for (const auto& session : sessions)
+	if (!g_audioPlaybackConnections.empty())
 	{
-		auto sourceId = std::wstring(session.SourceAppUserModelId());
-		std::wstring sourceIdLower = sourceId;
-		std::transform(sourceIdLower.begin(), sourceIdLower.end(), sourceIdLower.begin(), ::towlower);
-
-		for (const auto& [_, devicePair] : g_audioPlaybackConnections)
+		// Tier 1: exact device-name match
+		for (const auto& session : sessions)
 		{
-			auto deviceName = std::wstring(devicePair.first.Name());
-			if (deviceName.empty())
-				continue;
+			auto sourceId = std::wstring(session.SourceAppUserModelId());
+			std::wstring sourceIdLower = sourceId;
+			std::transform(sourceIdLower.begin(), sourceIdLower.end(), sourceIdLower.begin(), ::towlower);
 
-			std::wstring deviceNameLower = deviceName;
-			std::transform(deviceNameLower.begin(), deviceNameLower.end(), deviceNameLower.begin(), ::towlower);
+			for (const auto& [_, devicePair] : g_audioPlaybackConnections)
+			{
+				auto deviceName = std::wstring(devicePair.first.Name());
+				if (deviceName.empty()) continue;
+				std::wstring deviceNameLower = deviceName;
+				std::transform(deviceNameLower.begin(), deviceNameLower.end(), deviceNameLower.begin(), ::towlower);
+				if (sourceIdLower.find(deviceNameLower) != std::wstring::npos)
+				{
+					g_bluetoothSession = session;
+					return;
+				}
+			}
+		}
 
-			if (sourceIdLower.find(deviceNameLower) != std::wstring::npos)
+		// Tier 2: session with no '.' in source ID — likely a system/BT session, not a regular app
+		for (const auto& session : sessions)
+		{
+			auto sourceId = std::wstring(session.SourceAppUserModelId());
+			if (sourceId.find(L'.') == std::wstring::npos && !sourceId.empty())
 			{
 				g_bluetoothSession = session;
 				return;
 			}
 		}
+
+		// Tier 3: any session at all (best-effort when BT device is connected)
+		if (sessions.Size() > 0)
+		{
+			g_bluetoothSession = sessions.GetAt(0);
+			return;
+		}
 	}
 
-	// No device-name match — fall back to whatever session Windows considers current
+	// No BT device connected — use the currently focused PC media session
 	g_bluetoothSession = g_smtcSessionManager.GetCurrentSession();
 }
 
