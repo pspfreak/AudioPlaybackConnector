@@ -4,6 +4,7 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
+winrt::fire_and_forget ConnectDevice(DevicePicker, DeviceInformation);
 winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
@@ -300,14 +301,7 @@ void SetupMenu()
 	g_nowPlayingItem = MenuFlyoutItem();
 	g_nowPlayingItem.Icon(musicIcon);
 	g_nowPlayingItem.Visibility(Visibility::Collapsed);
-	g_nowPlayingItem.Click([](const auto&, const auto&) {
-		if (g_smtcSessionManager)
-		{
-			auto session = g_smtcSessionManager.GetCurrentSession();
-			if (session)
-				session.TryActivateAsync();
-		}
-	});
+	// Display-only item — clicking it has no action
 
 	// --- Media transport controls ---
 	FontIcon prevIcon;
@@ -507,7 +501,6 @@ winrt::fire_and_forget UpdateNowPlayingCache()
 			{
 				g_dispatcherQueue.TryEnqueue([]{
 					g_nowPlayingText.clear();
-					g_isPlaying = false;
 				});
 			}
 			co_return;
@@ -679,9 +672,6 @@ void SetupDevicePicker()
 			g_audioPlaybackConnections.erase(it);
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
-	});
-	g_devicePicker.RetryButtonClicked([](const auto& sender, const auto& args) {
-		ConnectDevice(sender, args.Device());
 	});
 }
 
