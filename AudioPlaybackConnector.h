@@ -6,7 +6,6 @@ using namespace winrt::Windows::Data::Json;
 using namespace winrt::Windows::Devices::Enumeration;
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Media::Audio;
-using namespace winrt::Windows::Media::Control;
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Controls;
 using namespace winrt::Windows::UI::Xaml::Hosting;
@@ -43,27 +42,12 @@ UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
 std::vector<std::wstring> g_lastDevices;
 
-// New: media session and now-playing
-GlobalSystemMediaTransportControlsSessionManager g_smtcSessionManager = nullptr;
-winrt::Windows::System::DispatcherQueue g_dispatcherQueue = nullptr;
-std::wstring g_nowPlayingText;
-bool g_showNowPlaying = true;
-
-// New: auto-reconnect at runtime
+// Auto-reconnect on unexpected disconnect
 bool g_autoReconnect = true;
 std::vector<DeviceInformation> g_pendingReconnect;
 std::unordered_map<std::wstring, int> g_reconnectAttempts;
 
-// Best-matched SMTC session (Bluetooth device preferred over PC apps), updated on UI thread
-GlobalSystemMediaTransportControlsSession g_bluetoothSession = nullptr;
-
-// Media control menu items (need global refs for dynamic updates)
-MenuFlyoutItem g_nowPlayingItem = nullptr;
-ToggleMenuFlyoutItem g_showNowPlayingToggle = nullptr;
-MenuFlyoutItem g_prevItem = nullptr;
-MenuFlyoutItem g_playPauseItem = nullptr;
-MenuFlyoutItem g_nextItem = nullptr;
-MenuFlyoutSeparator g_mediaSeparator = nullptr;
+// Menu item for auto-reconnect toggle
 ToggleMenuFlyoutItem g_autoReconnectToggle = nullptr;
 
 #include "Util.hpp"

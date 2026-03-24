@@ -9,9 +9,6 @@ winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
-winrt::fire_and_forget SetupMediaSession();
-void UpdateBluetoothSession();
-winrt::fire_and_forget UpdateNowPlayingCache();
 
 // Passed via PostMessageW lParam to marshal DeviceInformation to main thread
 struct ReconnectData {
@@ -75,15 +72,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	g_xamlCanvas = Canvas();
 	desktopSource.Content(g_xamlCanvas);
 
-	// Capture dispatcher queue for marshalling to UI thread from background callbacks
-	g_dispatcherQueue = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
-
 	LoadSettings();
 	SetupFlyout();
 	SetupMenu();
 	SetupDevicePicker();
 	SetupSvgIcon();
-	SetupMediaSession();
 
 	g_nid.hWnd = g_niid.hWnd = g_hWnd;
 	wcscpy_s(g_nid.szTip, _(L"AudioPlaybackConnector"));
@@ -210,7 +203,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		auto pData = std::unique_ptr<ReconnectData>(reinterpret_cast<ReconnectData*>(lParam));
 		auto deviceId = std::wstring(pData->device.Id());
 
-		// Track this device for reconnection
 		g_pendingReconnect.push_back(pData->device);
 		g_reconnectAttempts[deviceId] = 0;
 
@@ -226,7 +218,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			{
 				auto deviceId = std::wstring(device.Id());
 
-				// Already reconnected by some other means
+				// Already reconnected
 				if (g_audioPlaybackConnections.count(deviceId))
 				{
 					g_reconnectAttempts.erase(deviceId);
@@ -242,7 +234,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				}
 				else
 				{
-					// Give up — show retry button so user can manually retry
 					g_devicePicker.SetDisplayStatus(device, _(L"Connection lost"), DevicePickerDisplayStatusOptions::ShowRetryButton);
 					g_reconnectAttempts.erase(deviceId);
 				}
@@ -295,54 +286,6 @@ void SetupFlyout()
 
 void SetupMenu()
 {
-	// --- Now Playing display ---
-	FontIcon musicIcon;
-	musicIcon.Glyph(L"\xE8D6");
-
-	g_nowPlayingItem = MenuFlyoutItem();
-	g_nowPlayingItem.Icon(musicIcon);
-	g_nowPlayingItem.Visibility(Visibility::Collapsed);
-	// Display-only item — clicking it has no action
-
-	// --- Media transport controls ---
-	FontIcon prevIcon;
-	prevIcon.Glyph(L"\xE892");
-	g_prevItem = MenuFlyoutItem();
-	g_prevItem.Text(_(L"Previous"));
-	g_prevItem.Icon(prevIcon);
-	g_prevItem.Visibility(Visibility::Collapsed);
-	g_prevItem.Click([](const auto&, const auto&) {
-		if (g_bluetoothSession) g_bluetoothSession.TrySkipPreviousAsync();
-	});
-
-	g_playPauseItem = MenuFlyoutItem();
-	g_playPauseItem.Visibility(Visibility::Collapsed);
-	g_playPauseItem.Click([](const auto&, const auto&) {
-		if (g_bluetoothSession) g_bluetoothSession.TryTogglePlayPauseAsync();
-	});
-
-	FontIcon nextIcon;
-	nextIcon.Glyph(L"\xE893");
-	g_nextItem = MenuFlyoutItem();
-	g_nextItem.Text(_(L"Next"));
-	g_nextItem.Icon(nextIcon);
-	g_nextItem.Visibility(Visibility::Collapsed);
-	g_nextItem.Click([](const auto&, const auto&) {
-		if (g_bluetoothSession) g_bluetoothSession.TrySkipNextAsync();
-	});
-
-	g_mediaSeparator = MenuFlyoutSeparator();
-	g_mediaSeparator.Visibility(Visibility::Collapsed);
-
-	// --- Toggles ---
-	g_showNowPlayingToggle = ToggleMenuFlyoutItem();
-	g_showNowPlayingToggle.Text(_(L"Show Now Playing"));
-	g_showNowPlayingToggle.IsChecked(g_showNowPlaying);
-	g_showNowPlayingToggle.Click([](const auto&, const auto&) {
-		g_showNowPlaying = g_showNowPlayingToggle.IsChecked();
-		SaveSettings();
-	});
-
 	g_autoReconnectToggle = ToggleMenuFlyoutItem();
 	g_autoReconnectToggle.Text(_(L"Auto-Reconnect"));
 	g_autoReconnectToggle.IsChecked(g_autoReconnect);
@@ -353,7 +296,6 @@ void SetupMenu()
 
 	MenuFlyoutSeparator separator;
 
-	// --- Existing items ---
 	// https://docs.microsoft.com/en-us/windows/uwp/design/style/segoe-ui-symbol-font
 	FontIcon settingsIcon;
 	settingsIcon.Glyph(L"\xE713");
@@ -396,50 +338,15 @@ void SetupMenu()
 	});
 
 	MenuFlyout menu;
-	menu.Items().Append(g_nowPlayingItem);
-	menu.Items().Append(g_prevItem);
-	menu.Items().Append(g_playPauseItem);
-	menu.Items().Append(g_nextItem);
-	menu.Items().Append(g_mediaSeparator);
-	menu.Items().Append(g_showNowPlayingToggle);
 	menu.Items().Append(g_autoReconnectToggle);
 	menu.Items().Append(separator);
 	menu.Items().Append(settingsItem);
 	menu.Items().Append(exitItem);
 
 	menu.Opened([](const auto& sender, const auto&) {
-		auto session = g_bluetoothSession;
-
-		bool hasSession = session != nullptr;
-		bool showNowPlayingItem = g_showNowPlaying && hasSession && !g_nowPlayingText.empty();
-
-		g_nowPlayingItem.Visibility(showNowPlayingItem ? Visibility::Visible : Visibility::Collapsed);
-		if (showNowPlayingItem)
-			g_nowPlayingItem.Text(g_nowPlayingText);
-
-		Visibility mediaVis = hasSession ? Visibility::Visible : Visibility::Collapsed;
-		g_prevItem.Visibility(mediaVis);
-		g_playPauseItem.Visibility(mediaVis);
-		g_nextItem.Visibility(mediaVis);
-		g_mediaSeparator.Visibility(mediaVis);
-
-		if (hasSession)
-		{
-			// Query playback status live so icon is always accurate
-			auto playbackInfo = session.GetPlaybackInfo();
-			bool isPlaying = playbackInfo.PlaybackStatus() == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
-			FontIcon playPauseIcon;
-			playPauseIcon.Glyph(isPlaying ? L"\xE769" : L"\xE768");
-			g_playPauseItem.Icon(playPauseIcon);
-			g_playPauseItem.Text(isPlaying ? _(L"Pause") : _(L"Play"));
-		}
-
-		g_showNowPlayingToggle.IsChecked(g_showNowPlaying);
 		g_autoReconnectToggle.IsChecked(g_autoReconnect);
 
-		// Focus last visible item for keyboard navigation
-		auto menuFlyout = sender.as<MenuFlyout>();
-		auto menuItems = menuFlyout.Items();
+		auto menuItems = sender.as<MenuFlyout>().Items();
 		auto itemsCount = menuItems.Size();
 		if (itemsCount > 0)
 		{
@@ -452,140 +359,6 @@ void SetupMenu()
 	});
 
 	g_xamlMenu = menu;
-}
-
-winrt::fire_and_forget SetupMediaSession()
-{
-	try
-	{
-		g_smtcSessionManager = co_await GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
-
-		// Marshal session updates back to the UI thread so g_audioPlaybackConnections is safe to read
-		auto onSessionsChanged = [](const auto&, const auto&) {
-			if (g_dispatcherQueue)
-				g_dispatcherQueue.TryEnqueue([] {
-					UpdateBluetoothSession();
-					UpdateNowPlayingCache();
-				});
-		};
-
-		g_smtcSessionManager.SessionsChanged(onSessionsChanged);
-		g_smtcSessionManager.CurrentSessionChanged(onSessionsChanged);
-
-		// Initial update (already on UI thread — SetupMediaSession is fire_and_forget from wWinMain
-		// but resumes on a thread-pool thread after co_await, so marshal it)
-		if (g_dispatcherQueue)
-			g_dispatcherQueue.TryEnqueue([] {
-				UpdateBluetoothSession();
-				UpdateNowPlayingCache();
-			});
-	}
-	catch (winrt::hresult_error const&)
-	{
-		LOG_CAUGHT_EXCEPTION();
-	}
-}
-
-// Must be called on the UI thread. Picks the best SMTC session when a
-// Bluetooth device is connected, using a tiered strategy:
-//   1. Session whose SourceAppUserModelId contains the device name (ideal AVRCP match)
-//   2. First session that looks like a system/BT session (no '.' in the ID —
-//      standard app IDs always have at least one: "Spotify.exe", "Microsoft.ZuneMusic_...")
-//   3. Any available session (best-effort)
-//   4. If no BT device connected, fall back to the current focused session
-void UpdateBluetoothSession()
-{
-	if (!g_smtcSessionManager)
-	{
-		g_bluetoothSession = nullptr;
-		return;
-	}
-
-	auto sessions = g_smtcSessionManager.GetSessions();
-
-	if (!g_audioPlaybackConnections.empty())
-	{
-		// Tier 1: exact device-name match
-		for (const auto& session : sessions)
-		{
-			auto sourceId = std::wstring(session.SourceAppUserModelId());
-			std::wstring sourceIdLower = sourceId;
-			std::transform(sourceIdLower.begin(), sourceIdLower.end(), sourceIdLower.begin(), ::towlower);
-
-			for (const auto& [_, devicePair] : g_audioPlaybackConnections)
-			{
-				auto deviceName = std::wstring(devicePair.first.Name());
-				if (deviceName.empty()) continue;
-				std::wstring deviceNameLower = deviceName;
-				std::transform(deviceNameLower.begin(), deviceNameLower.end(), deviceNameLower.begin(), ::towlower);
-				if (sourceIdLower.find(deviceNameLower) != std::wstring::npos)
-				{
-					g_bluetoothSession = session;
-					return;
-				}
-			}
-		}
-
-		// Tier 2: session with no '.' in source ID — likely a system/BT session, not a regular app
-		for (const auto& session : sessions)
-		{
-			auto sourceId = std::wstring(session.SourceAppUserModelId());
-			if (sourceId.find(L'.') == std::wstring::npos && !sourceId.empty())
-			{
-				g_bluetoothSession = session;
-				return;
-			}
-		}
-
-		// Tier 3: any session at all (best-effort when BT device is connected)
-		if (sessions.Size() > 0)
-		{
-			g_bluetoothSession = sessions.GetAt(0);
-			return;
-		}
-	}
-
-	// No BT device connected — use the currently focused PC media session
-	g_bluetoothSession = g_smtcSessionManager.GetCurrentSession();
-}
-
-winrt::fire_and_forget UpdateNowPlayingCache()
-{
-	try
-	{
-		// g_bluetoothSession is set on the UI thread by UpdateBluetoothSession();
-		// snapshot it here before any suspension point
-		auto session = g_bluetoothSession;
-		if (!session)
-		{
-			g_nowPlayingText.clear();
-			co_return;
-		}
-
-		auto props = co_await session.TryGetMediaPropertiesAsync();
-		std::wstring text;
-		if (props)
-		{
-			auto title = std::wstring(props.Title());
-			auto artist = std::wstring(props.Artist());
-			if (artist.empty())
-				text = title;
-			else
-				text = artist + L" \u2013 " + title; // en-dash separator
-		}
-
-		// Resume back on the UI thread to safely write the global
-		if (g_dispatcherQueue)
-		{
-			g_dispatcherQueue.TryEnqueue([text = std::move(text)]{
-				g_nowPlayingText = text;
-			});
-		}
-	}
-	catch (winrt::hresult_error const&)
-	{
-		LOG_CAUGHT_EXCEPTION();
-	}
 }
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
@@ -611,7 +384,6 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					{
 						if (g_autoReconnect)
 						{
-							// Show reconnecting status and schedule retry on main thread
 							g_devicePicker.SetDisplayStatus(it->second.first, _(L"Reconnecting..."),
 								DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 							auto pData = new ReconnectData{ it->second.first };
@@ -678,9 +450,6 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	if (success)
 	{
 		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
-		// Re-evaluate session now that a device is connected (AVRCP session may already be active)
-		if (g_dispatcherQueue)
-			g_dispatcherQueue.TryEnqueue([] { UpdateBluetoothSession(); UpdateNowPlayingCache(); });
 	}
 	else
 	{
@@ -732,9 +501,6 @@ void SetupDevicePicker()
 			g_audioPlaybackConnections.erase(it);
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
-		// Re-evaluate session now that device is gone
-		UpdateBluetoothSession();
-		UpdateNowPlayingCache();
 	});
 }
 
